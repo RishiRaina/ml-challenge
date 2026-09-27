@@ -6,6 +6,7 @@
 
 # Allow the main Python script
 !business_entity_resolution.py
+!fast_predict.py
 
 # Allow the README
 !README.md
