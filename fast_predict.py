@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 
 """
-FAST prediction for the Business Entity Resolution challenge.
+FAST PREDICTOR V2
+=================
 
-Uses:
-    - existing test SQLite index
-    - existing LightGBM model
-    - existing isotonic calibrator
-    - existing tuned threshold
+Uses the already-created:
 
-Parallelizes Source1 prediction across persistent worker processes.
+    student_resource/cache/er_index_test.sqlite
+    student_resource/cache/lightgbm_matcher.txt
+    student_resource/cache/calibrator.pkl
+    student_resource/cache/threshold.json
 
-IMPORTANT:
-Source1 columns are:
+Does NOT rebuild the index.
+Does NOT retrain the model.
+
+Source1 columns:
+
     entity_id
     business_name
     business_address
@@ -22,365 +25,535 @@ Source1 columns are:
 from __future__ import annotations
 
 import csv
-import os
-import sys
-import time
-import sqlite3
 import multiprocessing as mp
+import os
+import sqlite3
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-# ---------------------------------------------------------------------------
-# Import the existing pipeline functions.
-# ---------------------------------------------------------------------------
+import lightgbm as lgb
 
 import business_entity_resolution as ber
 
-try:
-    import lightgbm as lgb
-except Exception as e:
-    raise RuntimeError(
-        "LightGBM could not be imported. Make sure the same Python environment "
-        "used for training is active."
-    ) from e
 
-
-# ===========================================================================
-# CONFIG
-# ===========================================================================
+# ============================================================================
+# PATHS
+# ============================================================================
 
 ROOT = Path("student_resource")
 
-TEST_SOURCE1 = ROOT / "dataset" / "test" / "test_source1.tsv"
+SOURCE1 = ROOT / "dataset" / "test" / "test_source1.tsv"
 
 DB_PATH = ROOT / "cache" / "er_index_test.sqlite"
 MODEL_PATH = ROOT / "cache" / "lightgbm_matcher.txt"
-CALIBRATOR_PATH = ROOT / "cache" / "calibrator.pkl"
-THRESHOLD_PATH = ROOT / "cache" / "threshold.json"
 
-OUTPUT_DIR = ROOT / "output"
+OUTPUT = ROOT / "output"
 
-MATCH_PATH = OUTPUT_DIR / "matching_results.tsv"
-CANDIDATE_PATH = OUTPUT_DIR / "candidate_pairs.tsv"
+MATCH_FILE = OUTPUT / "matching_results.tsv"
+CANDIDATE_FILE = OUTPUT / "candidate_pairs.tsv"
 
 
-# ---------------------------------------------------------------------------
-# Performance settings
-# ---------------------------------------------------------------------------
+# ============================================================================
+# PERFORMANCE
+# ============================================================================
+
+CPU_COUNT = os.cpu_count() or 4
 
 # Your CPU has 16 logical processors.
-# 8 workers is a reasonable starting point because SQLite + RapidFuzz
-# are both CPU/storage intensive.
-WORKERS = max(2, min(8, (os.cpu_count() or 4) - 2))
+WORKERS = min(8, max(2, CPU_COUNT - 2))
 
-# Number of Source1 rows loaded at a time by the main process.
-READ_CHUNK = 16000
+# Number of Source1 rows read at once.
+READ_CHUNK = 32000
 
-# Number of tasks grouped into one multiprocessing scheduling unit.
-POOL_CHUNKSIZE = 64
+# Multiprocessing scheduling batch.
+POOL_CHUNKSIZE = 128
 
-# Flush output periodically so that files visibly grow during prediction.
-FLUSH_EVERY = 5000
+# Print progress every N records.
+PRINT_EVERY = 5000
 
-# The original pipeline uses this final candidate cap.
-FINAL_CANDIDATE_MAX = 80
+
+# ============================================================================
+# CANDIDATE LIMITS
+# ============================================================================
+
+EXACT_NAME_LIMIT = 80
+EXACT_ADDRESS_LIMIT = 80
+
+NAME_PREFIX_LIMIT = 30
+ADDRESS_PREFIX_LIMIT = 30
+
+TOKEN_LIMIT = 20
+
+FINAL_CANDIDATE_LIMIT = 60
+
+
+# ============================================================================
+# MATCH THRESHOLDS
+# ============================================================================
 
 KEEP_NAME = 0.88
 KEEP_ADDRESS = 0.88
 
 
-# ===========================================================================
-# GLOBALS INITIALIZED INSIDE EACH WORKER
-# ===========================================================================
+# ============================================================================
+# WORKER GLOBALS
+# ============================================================================
 
-WORKER_CON = None
-WORKER_MODEL = None
-WORKER_CALIBRATOR = None
-WORKER_THRESHOLD = None
+CON = None
+MODEL = None
+CALIBRATOR = None
+THRESHOLD = None
 
 
-# ===========================================================================
+# ============================================================================
+# STARTUP BANNER
+# ============================================================================
+
+print("=" * 70)
+print("FAST PREDICTION V2")
+print("=" * 70)
+print("Script started successfully.")
+print()
+
+
+# ============================================================================
 # WORKER INITIALIZATION
-# ===========================================================================
+# ============================================================================
 
-def worker_init(db_path, model_path, calibrator_path, threshold_path):
-    """
-    Runs once per worker.
+def init_worker(db_path, model_path):
 
-    Each worker gets:
-        - its own SQLite read-only connection
-        - its own LightGBM Booster
-        - its own calibration object
-        - the same threshold
-    """
+    global CON
+    global MODEL
+    global CALIBRATOR
+    global THRESHOLD
 
-    global WORKER_CON
-    global WORKER_MODEL
-    global WORKER_CALIBRATOR
-    global WORKER_THRESHOLD
+    # ------------------------------------------------------------
+    # SQLite read-only connection
+    # ------------------------------------------------------------
 
-    # -----------------------------------------------------------------------
-    # SQLite read-only connection.
-    #
-    # Multiple workers are readers only, so this is safe.
-    # -----------------------------------------------------------------------
+    db_uri = (
+        "file:"
+        + Path(db_path).resolve().as_posix()
+        + "?mode=ro"
+    )
 
-    uri = f"file:{Path(db_path).resolve().as_posix()}?mode=ro"
-
-    WORKER_CON = sqlite3.connect(
-        uri,
+    CON = sqlite3.connect(
+        db_uri,
         uri=True,
         timeout=60,
         check_same_thread=False,
     )
 
-    # Read-only performance settings.
-    WORKER_CON.execute("PRAGMA query_only=ON")
-    WORKER_CON.execute("PRAGMA temp_store=MEMORY")
-    WORKER_CON.execute("PRAGMA cache_size=-65536")
+    CON.execute(
+        "PRAGMA query_only=ON"
+    )
 
-    # -----------------------------------------------------------------------
-    # Load LightGBM model.
-    # -----------------------------------------------------------------------
+    CON.execute(
+        "PRAGMA temp_store=MEMORY"
+    )
 
-    WORKER_MODEL = lgb.Booster(
+    CON.execute(
+        "PRAGMA cache_size=-32768"
+    )
+
+    # ------------------------------------------------------------
+    # Load LightGBM once per worker
+    # ------------------------------------------------------------
+
+    MODEL = lgb.Booster(
         model_file=str(model_path)
     )
 
-    # -----------------------------------------------------------------------
-    # Load calibration.
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Load calibration + threshold
+    # ------------------------------------------------------------
 
-    WORKER_CALIBRATOR = ber.load_calibrator()
+    CALIBRATOR = ber.load_calibrator()
 
-    # -----------------------------------------------------------------------
-    # Load threshold.
-    # -----------------------------------------------------------------------
-
-    WORKER_THRESHOLD = ber.load_threshold()
+    THRESHOLD = ber.load_threshold()
 
 
-# ===========================================================================
-# SINGLE SOURCE1 ROW
-# ===========================================================================
+# ============================================================================
+# SQLITE FETCH
+# ============================================================================
 
-def process_one(row):
-    """
-    Process exactly one Source1 record.
+def fetch_rows(sql, params, limit):
 
-    Input:
-        (
-            source1_entity_id,
-            business_name,
-            business_address,
-            country
+    return CON.execute(
+        sql + " LIMIT ?",
+        (*params, limit),
+    ).fetchall()
+
+
+# ============================================================================
+# FAST CANDIDATE GENERATION
+# ============================================================================
+
+def get_candidates(
+    country,
+    name,
+    address,
+):
+
+    seen = set()
+    candidates = []
+
+    def add(rows):
+
+        for row in rows:
+
+            rid = row[0]
+
+            if rid not in seen:
+
+                seen.add(rid)
+                candidates.append(row)
+
+    # ========================================================================
+    # 1. EXACT NAME
+    # ========================================================================
+
+    if name:
+
+        rows = fetch_rows(
+            """
+            SELECT
+                rid,
+                entity_id,
+                source,
+                country,
+                name,
+                address
+            FROM records
+            WHERE country = ?
+              AND name = ?
+            """,
+            (
+                country,
+                name,
+            ),
+            EXACT_NAME_LIMIT,
         )
 
-    Returns:
-        (
-            source1_entity_id,
-            matches,
-            final_candidates
-        )
-    """
+        add(rows)
 
-    global WORKER_CON
-    global WORKER_MODEL
-    global WORKER_CALIBRATOR
-    global WORKER_THRESHOLD
+    # ========================================================================
+    # If exact name found, this is usually already a very strong candidate
+    # set. Avoid doing additional expensive SQLite searches.
+    # ========================================================================
 
-    source1_id, raw_name, raw_address, raw_country = row
+    if candidates:
 
-    # -----------------------------------------------------------------------
-    # Normalize exactly as the original pipeline does.
-    # -----------------------------------------------------------------------
+        return candidates[:FINAL_CANDIDATE_LIMIT]
 
-    name = ber.normalize_name(raw_name)
-    address = ber.normalize_address(raw_address)
-    country = str(raw_country)
+    # ========================================================================
+    # 2. EXACT ADDRESS
+    # ========================================================================
 
-    # -----------------------------------------------------------------------
-    # Generate candidates using the existing blocking/index logic.
-    # -----------------------------------------------------------------------
+    if address:
 
-    candidates = ber.candidate_rows(
-        WORKER_CON,
-        country,
-        name,
-        address,
-    )
-
-    if not candidates:
-        return (
-            source1_id,
-            [],
-            [],
+        rows = fetch_rows(
+            """
+            SELECT
+                rid,
+                entity_id,
+                source,
+                country,
+                name,
+                address
+            FROM records
+            WHERE country = ?
+              AND address = ?
+            """,
+            (
+                country,
+                address,
+            ),
+            EXACT_ADDRESS_LIMIT,
         )
 
-    # -----------------------------------------------------------------------
-    # Apply the same FINAL_CANDIDATE_MAX logic as the original predictor.
-    # -----------------------------------------------------------------------
+        add(rows)
 
-    if len(candidates) > FINAL_CANDIDATE_MAX:
+    if candidates:
 
-        scored = []
+        return candidates[:FINAL_CANDIDATE_LIMIT]
 
-        for c in candidates:
+    # ========================================================================
+    # 3. NAME PREFIX
+    # ========================================================================
 
-            candidate_name = c[4]
-            candidate_address = c[5]
+    name_prefix = ber.prefix_key(name)
 
-            name_score = max(
-                ber.safe_ratio(name, candidate_name),
-                ber.W(name, candidate_name),
-                ber.token_set(name, candidate_name),
-            )
+    if name_prefix:
 
-            address_score = max(
-                ber.safe_ratio(address, candidate_address),
-                ber.W(address, candidate_address),
-                ber.token_set(address, candidate_address),
-            )
-
-            lexical_score = (
-                0.6 * name_score +
-                0.4 * address_score
-            )
-
-            scored.append(
-                (
-                    lexical_score,
-                    c,
-                )
-            )
-
-        scored.sort(
-            key=lambda x: x[0],
-            reverse=True,
+        rows = fetch_rows(
+            """
+            SELECT
+                rid,
+                entity_id,
+                source,
+                country,
+                name,
+                address
+            FROM records
+            WHERE country = ?
+              AND name_prefix = ?
+            """,
+            (
+                country,
+                name_prefix,
+            ),
+            NAME_PREFIX_LIMIT,
         )
 
-        candidates = [
-            x[1]
-            for x in scored[:FINAL_CANDIDATE_MAX]
+        add(rows)
+
+    # ========================================================================
+    # 4. ADDRESS PREFIX
+    # ========================================================================
+
+    address_prefix = ber.prefix_key(address)
+
+    if address_prefix:
+
+        rows = fetch_rows(
+            """
+            SELECT
+                rid,
+                entity_id,
+                source,
+                country,
+                name,
+                address
+            FROM records
+            WHERE country = ?
+              AND addr_prefix = ?
+            """,
+            (
+                country,
+                address_prefix,
+            ),
+            ADDRESS_PREFIX_LIMIT,
+        )
+
+        add(rows)
+
+    if candidates:
+
+        return candidates[:FINAL_CANDIDATE_LIMIT]
+
+    # ========================================================================
+    # 5. NAME TOKEN FALLBACK
+    # ========================================================================
+
+    name_tokens = ber.tokens(name)
+
+    if name_tokens:
+
+        # At most three tokens to keep the SQL query cheap.
+        name_tokens = name_tokens[:3]
+
+        hashes = [
+            ber.token_hash(token)
+            for token in name_tokens
         ]
 
-    # -----------------------------------------------------------------------
-    # Build model features.
-    # -----------------------------------------------------------------------
-
-    features = np.vstack([
-        ber.pair_features(
-            name,
-            address,
-            country,
-            c[4],
-            c[5],
-            c[3],
+        placeholders = ",".join(
+            "?" for _ in hashes
         )
-        for c in candidates
-    ])
 
-    # -----------------------------------------------------------------------
-    # LightGBM prediction.
-    # -----------------------------------------------------------------------
+        rows = CON.execute(
+            f"""
+            SELECT
+                r.rid,
+                r.entity_id,
+                r.source,
+                r.country,
+                r.name,
+                r.address
+            FROM name_token t
+            JOIN records r
+              ON r.rid = t.rid
+            WHERE r.country = ?
+              AND t.tok IN ({placeholders})
+            GROUP BY r.rid
+            ORDER BY COUNT(*) DESC
+            LIMIT ?
+            """,
+            (
+                country,
+                *hashes,
+                TOKEN_LIMIT,
+            ),
+        ).fetchall()
 
-    raw_probs = WORKER_MODEL.predict(features)
+        add(rows)
 
-    # -----------------------------------------------------------------------
-    # Isotonic calibration.
-    # -----------------------------------------------------------------------
+    return candidates[:FINAL_CANDIDATE_LIMIT]
 
-    cal_probs = ber.apply_calibrator(
-        WORKER_CALIBRATOR,
-        raw_probs,
+
+# ============================================================================
+# SCORE CANDIDATES
+# ============================================================================
+
+def score_candidates(
+    source_name,
+    source_address,
+    country,
+    candidates,
+):
+
+    if not candidates:
+
+        return [], []
+
+    # ========================================================================
+    # Build the same 22-feature vectors used during training.
+    # ========================================================================
+
+    feature_rows = []
+
+    for candidate in candidates:
+
+        feature_rows.append(
+            ber.pair_features(
+                source_name,
+                source_address,
+                country,
+                candidate[4],
+                candidate[5],
+                candidate[3],
+            )
+        )
+
+    features = np.vstack(
+        feature_rows
     )
 
-    # -----------------------------------------------------------------------
-    # Candidate IDs.
-    #
-    # c[1] is the entity ID according to the existing SQLite index schema.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # LightGBM
+    # ========================================================================
 
-    pairs = [
-        (
-            c[1],
-            float(prob),
-            c,
-        )
-        for c, prob in zip(
-            candidates,
-            cal_probs,
-        )
-    ]
+    probabilities = MODEL.predict(
+        features
+    )
 
-    final_candidates = []
+    # ========================================================================
+    # Calibration
+    # ========================================================================
 
-    seen_candidates = set()
+    probabilities = ber.apply_calibrator(
+        CALIBRATOR,
+        probabilities,
+    )
 
-    for cid, _, _ in pairs:
+    # ========================================================================
+    # Candidate IDs
+    # ========================================================================
 
-        if cid not in seen_candidates:
+    candidate_ids = []
 
-            seen_candidates.add(cid)
+    seen = set()
 
-            final_candidates.append(cid)
+    for candidate in candidates:
 
-    # -----------------------------------------------------------------------
-    # Final matching decision.
-    # -----------------------------------------------------------------------
+        cid = str(candidate[1])
+
+        if cid not in seen:
+
+            seen.add(cid)
+            candidate_ids.append(cid)
+
+    # ========================================================================
+    # Final decisions
+    # ========================================================================
 
     matches = []
 
     seen_matches = set()
 
-    for cid, probability, c in pairs:
+    for candidate, probability in zip(
+        candidates,
+        probabilities,
+    ):
 
-        candidate_name = c[4]
-        candidate_address = c[5]
+        cid = str(candidate[1])
 
-        strong_name = bool(
-            name
-            and candidate_name
-            and max(
-                ber.safe_ratio(
-                    name,
-                    candidate_name,
-                ),
-                ber.W(
-                    name,
-                    candidate_name,
-                ),
-                ber.token_set(
-                    name,
-                    candidate_name,
-                ),
-            ) >= KEEP_NAME
-        )
+        candidate_name = candidate[4]
+        candidate_address = candidate[5]
 
-        strong_address = bool(
-            address
-            and candidate_address
-            and max(
-                ber.safe_ratio(
-                    address,
-                    candidate_address,
-                ),
-                ber.W(
-                    address,
-                    candidate_address,
-                ),
-                ber.token_set(
-                    address,
-                    candidate_address,
-                ),
-            ) >= KEEP_ADDRESS
-        )
+        # --------------------------------------------------------
+        # Strong name
+        # --------------------------------------------------------
 
-        # Same decision rule as the original predictor.
         if (
-            probability >= WORKER_THRESHOLD
+            source_name
+            and candidate_name
+        ):
+
+            name_score = max(
+                ber.safe_ratio(
+                    source_name,
+                    candidate_name,
+                ),
+                ber.W(
+                    source_name,
+                    candidate_name,
+                ),
+                ber.token_set(
+                    source_name,
+                    candidate_name,
+                ),
+            )
+
+            strong_name = (
+                name_score >= KEEP_NAME
+            )
+
+        else:
+
+            strong_name = False
+
+        # --------------------------------------------------------
+        # Strong address
+        # --------------------------------------------------------
+
+        if (
+            source_address
+            and candidate_address
+        ):
+
+            address_score = max(
+                ber.safe_ratio(
+                    source_address,
+                    candidate_address,
+                ),
+                ber.W(
+                    source_address,
+                    candidate_address,
+                ),
+                ber.token_set(
+                    source_address,
+                    candidate_address,
+                ),
+            )
+
+            strong_address = (
+                address_score >= KEEP_ADDRESS
+            )
+
+        else:
+
+            strong_address = False
+
+        # --------------------------------------------------------
+        # Final decision
+        # --------------------------------------------------------
+
+        if (
+            float(probability) >= THRESHOLD
             or (
                 strong_name
                 and strong_address
@@ -394,11 +567,11 @@ def process_one(row):
                 matches.append(
                     (
                         cid,
-                        probability,
+                        float(probability),
                     )
                 )
 
-    # Highest-confidence matches first.
+    # Highest confidence first.
     matches.sort(
         key=lambda x: x[1],
         reverse=True,
@@ -410,57 +583,126 @@ def process_one(row):
     ]
 
     return (
-        source1_id,
         match_ids,
-        final_candidates,
+        candidate_ids,
     )
 
 
-# ===========================================================================
+# ============================================================================
+# PROCESS ONE SOURCE1 RECORD
+# ============================================================================
+
+def process_one(row):
+
+    source1_id = str(
+        row[0]
+    )
+
+    raw_name = str(
+        row[1]
+    )
+
+    raw_address = str(
+        row[2]
+    )
+
+    country = str(
+        row[3]
+    )
+
+    # ========================================================================
+    # Normalize
+    # ========================================================================
+
+    name = ber.normalize_name(
+        raw_name
+    )
+
+    address = ber.normalize_address(
+        raw_address
+    )
+
+    # ========================================================================
+    # Blocking
+    # ========================================================================
+
+    candidates = get_candidates(
+        country,
+        name,
+        address,
+    )
+
+    # ========================================================================
+    # Scoring
+    # ========================================================================
+
+    matches, candidate_ids = score_candidates(
+        name,
+        address,
+        country,
+        candidates,
+    )
+
+    return (
+        source1_id,
+        matches,
+        candidate_ids,
+    )
+
+
+# ============================================================================
 # MAIN
-# ===========================================================================
+# ============================================================================
 
 def main():
 
-    print("=" * 60)
-    print("FAST PREDICTION")
-    print("=" * 60)
+    print(
+        f"Workers: {WORKERS}"
+    )
 
-    print(f"Workers: {WORKERS}")
-    print(f"CPU logical processors: {os.cpu_count()}")
-    print(f"Source1: {TEST_SOURCE1}")
-    print(f"Test index: {DB_PATH}")
-    print(f"Model: {MODEL_PATH}")
+    print(
+        f"CPU logical processors: {CPU_COUNT}"
+    )
+
+    print(
+        f"Source1: {SOURCE1}"
+    )
+
+    print(
+        f"Test index: {DB_PATH}"
+    )
+
+    print(
+        f"Model: {MODEL_PATH}"
+    )
+
     print()
 
-    # -----------------------------------------------------------------------
-    # Check required files.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Validate files
+    # ========================================================================
 
-    required_files = [
-        TEST_SOURCE1,
+    required = [
+        SOURCE1,
         DB_PATH,
         MODEL_PATH,
     ]
 
-    for path in required_files:
+    for path in required:
 
         if not path.exists():
 
             raise FileNotFoundError(
-                f"Required file does not exist:\n{path}"
+                f"Required file not found:\n{path}"
             )
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
+    # ========================================================================
+    # Verify SQLite index
+    # ========================================================================
+
+    print(
+        "Checking test index..."
     )
-
-    # -----------------------------------------------------------------------
-    # Check test index size.
-    # -----------------------------------------------------------------------
-
-    print("Checking test index...")
 
     check_con = sqlite3.connect(
         str(DB_PATH)
@@ -468,34 +710,27 @@ def main():
 
     try:
 
-        result = check_con.execute(
-            """
-            SELECT COUNT(*)
-            FROM records
-            """
-        ).fetchone()
-
-        if result is not None:
-
-            indexed_records = int(result[0])
-
-            print(
-                f"Indexed target records: "
-                f"{indexed_records:,}"
-            )
+        indexed_count = check_con.execute(
+            "SELECT COUNT(*) FROM records"
+        ).fetchone()[0]
 
     finally:
 
         check_con.close()
 
+    print(
+        f"Indexed target records: "
+        f"{indexed_count:,}"
+    )
+
     print()
 
-    # -----------------------------------------------------------------------
-    # Load Source1 header only to verify columns.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Verify Source1 columns
+    # ========================================================================
 
     header = pd.read_csv(
-        TEST_SOURCE1,
+        SOURCE1,
         sep="\t",
         dtype=str,
         nrows=0,
@@ -508,149 +743,147 @@ def main():
         "country",
     ]
 
-    actual_columns = list(header.columns)
+    actual_columns = list(
+        header.columns
+    )
 
     print(
-        "Source1 columns:",
-        actual_columns,
+        f"Source1 columns: "
+        f"{actual_columns}"
     )
 
     if actual_columns != expected_columns:
 
         raise RuntimeError(
-            "\nUnexpected Source1 columns.\n"
+            "\nSource1 columns are not what the predictor expects.\n"
             f"Expected: {expected_columns}\n"
-            f"Found:    {actual_columns}\n"
+            f"Found: {actual_columns}\n"
         )
 
     print()
 
-    # -----------------------------------------------------------------------
-    # Load threshold just for display.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Load artifacts
+    # ========================================================================
 
-    threshold = ber.load_threshold()
+    global THRESHOLD
+    global CALIBRATOR
 
-    calibrator = ber.load_calibrator()
+    CALIBRATOR = ber.load_calibrator()
+
+    THRESHOLD = ber.load_threshold()
 
     print(
         f"Using calibrated probabilities: "
-        f"{calibrator is not None}"
+        f"{CALIBRATOR is not None}"
     )
 
     print(
-        f"Decision threshold: {threshold:.3f}"
+        f"Decision threshold: "
+        f"{THRESHOLD:.3f}"
     )
 
     print()
 
-    # -----------------------------------------------------------------------
-    # Truncate/create output files.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Output directory
+    # ========================================================================
 
-    MATCH_PATH.write_text(
+    OUTPUT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ========================================================================
+    # Overwrite partial outputs
+    # ========================================================================
+
+    MATCH_FILE.write_text(
         "source1_entity_id\tmatched_entity_ids\n",
         encoding="utf-8",
     )
 
-    CANDIDATE_PATH.write_text(
+    CANDIDATE_FILE.write_text(
         "source1_entity_id\tcandidate_entity_ids\n",
         encoding="utf-8",
     )
 
-    # -----------------------------------------------------------------------
-    # Timing.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Expected Source1 count
+    # ========================================================================
 
-    start_time = time.time()
+    EXPECTED = 1_732_544
 
     processed = 0
     total_candidates = 0
     total_matches = 0
 
-    # Expected number of Source1 records.
-    EXPECTED = 1_732_544
+    start_time = time.time()
 
-    # -----------------------------------------------------------------------
-    # Open output files.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Output files
+    # ========================================================================
 
     with (
-        MATCH_PATH.open(
+        MATCH_FILE.open(
             "a",
             encoding="utf-8",
             newline="",
-        ) as match_file,
+        ) as match_handle,
 
-        CANDIDATE_PATH.open(
+        CANDIDATE_FILE.open(
             "a",
             encoding="utf-8",
             newline="",
-        ) as candidate_file
+        ) as candidate_handle
     ):
 
         match_writer = csv.writer(
-            match_file,
+            match_handle,
             delimiter="\t",
             lineterminator="\n",
         )
 
         candidate_writer = csv.writer(
-            candidate_file,
+            candidate_handle,
             delimiter="\t",
             lineterminator="\n",
         )
 
-        # -------------------------------------------------------------------
-        # IMPORTANT:
-        # ONE pool for the ENTIRE run.
-        #
-        # We do NOT recreate workers for every pandas chunk.
-        # -------------------------------------------------------------------
+        # ====================================================================
+        # Persistent worker pool
+        # ====================================================================
 
         print(
             "Starting persistent worker pool..."
         )
 
         print(
-            "Do not start another prediction process."
+            "Prediction is now running."
         )
 
         print()
 
         with mp.Pool(
             processes=WORKERS,
-            initializer=worker_init,
+            initializer=init_worker,
             initargs=(
                 str(DB_PATH),
                 str(MODEL_PATH),
-                str(CALIBRATOR_PATH),
-                str(THRESHOLD_PATH),
             ),
         ) as pool:
 
-            # ---------------------------------------------------------------
-            # Stream Source1.
-            # ---------------------------------------------------------------
+            # ================================================================
+            # Stream Source1
+            # ================================================================
 
             for chunk in pd.read_csv(
-                TEST_SOURCE1,
+                SOURCE1,
                 sep="\t",
                 dtype=str,
                 keep_default_na=False,
                 chunksize=READ_CHUNK,
             ):
-
-                # -----------------------------------------------------------
-                # Convert pandas rows to compact tuples.
-                #
-                # IMPORTANT:
-                # Actual columns:
-                #   entity_id
-                #   business_name
-                #   business_address
-                #   country
-                # -----------------------------------------------------------
 
                 tasks = (
                     (
@@ -664,9 +897,9 @@ def main():
                     )
                 )
 
-                # -----------------------------------------------------------
-                # Persistent multiprocessing.
-                # -----------------------------------------------------------
+                # ============================================================
+                # Persistent multiprocessing
+                # ============================================================
 
                 for result in pool.imap(
                     process_one,
@@ -676,16 +909,13 @@ def main():
 
                     (
                         source1_id,
-                        match_ids,
+                        matches,
                         candidate_ids,
                     ) = result
 
-                    # -------------------------------------------------------
-                    # candidate_pairs.tsv
-                    #
-                    # This MUST contain the exact candidates fed to
-                    # the final model.
-                    # -------------------------------------------------------
+                    # --------------------------------------------------------
+                    # Candidate output
+                    # --------------------------------------------------------
 
                     candidate_writer.writerow(
                         [
@@ -696,15 +926,15 @@ def main():
                         ]
                     )
 
-                    # -------------------------------------------------------
-                    # matching_results.tsv
-                    # -------------------------------------------------------
+                    # --------------------------------------------------------
+                    # Match output
+                    # --------------------------------------------------------
 
                     match_writer.writerow(
                         [
                             source1_id,
                             ",".join(
-                                match_ids
+                                matches
                             ),
                         ]
                     )
@@ -716,28 +946,26 @@ def main():
                     )
 
                     total_matches += len(
-                        match_ids
+                        matches
                     )
 
-                    # -------------------------------------------------------
-                    # Progress.
-                    # -------------------------------------------------------
+                    # ========================================================
+                    # Progress
+                    # ========================================================
 
-                    if processed % FLUSH_EVERY == 0:
+                    if processed % PRINT_EVERY == 0:
 
-                        match_file.flush()
-                        candidate_file.flush()
+                        match_handle.flush()
+                        candidate_handle.flush()
 
                         elapsed = (
                             time.time()
                             - start_time
                         )
 
-                        rate = (
+                        rows_per_second = (
                             processed
                             / elapsed
-                            if elapsed > 0
-                            else 0
                         )
 
                         remaining = (
@@ -746,13 +974,13 @@ def main():
                         )
 
                         eta_seconds = (
-                            remaining / rate
-                            if rate > 0
-                            else 0
+                            remaining
+                            / rows_per_second
                         )
 
                         eta_minutes = (
-                            eta_seconds / 60
+                            eta_seconds
+                            / 60
                         )
 
                         percent = (
@@ -761,12 +989,12 @@ def main():
                             * 100
                         )
 
-                        avg_candidates = (
+                        average_candidates = (
                             total_candidates
                             / processed
                         )
 
-                        avg_matches = (
+                        average_matches = (
                             total_matches
                             / processed
                         )
@@ -775,47 +1003,57 @@ def main():
                             f"[{time.strftime('%H:%M:%S')}] "
                             f"{processed:,}/{EXPECTED:,} "
                             f"({percent:.2f}%) | "
-                            f"{rate:.1f} rows/s | "
+                            f"{rows_per_second:.1f} rows/s | "
                             f"ETA {eta_minutes:.1f} min | "
-                            f"avg candidates {avg_candidates:.1f} | "
-                            f"avg matches {avg_matches:.2f}",
+                            f"avg candidates "
+                            f"{average_candidates:.2f} | "
+                            f"avg matches "
+                            f"{average_matches:.3f}",
                             flush=True,
                         )
 
-    # -----------------------------------------------------------------------
-    # Finished.
-    # -----------------------------------------------------------------------
+    # ========================================================================
+    # Complete
+    # ========================================================================
 
-    elapsed = time.time() - start_time
+    elapsed = (
+        time.time()
+        - start_time
+    )
 
     print()
-    print("=" * 60)
+    print("=" * 70)
     print("PREDICTION COMPLETE")
-    print("=" * 60)
+    print("=" * 70)
 
     print(
-        f"Processed Source1 rows: "
+        f"Processed: "
         f"{processed:,}"
     )
 
     print(
-        f"Total final candidates: "
+        f"Expected: "
+        f"{EXPECTED:,}"
+    )
+
+    print(
+        f"Total candidates: "
         f"{total_candidates:,}"
     )
 
     print(
-        f"Total predicted matches: "
+        f"Total matches: "
         f"{total_matches:,}"
     )
 
     print(
-        f"Average candidates / Source1: "
+        f"Average candidates/S1: "
         f"{total_candidates / max(processed, 1):.2f}"
     )
 
     print(
-        f"Average matches / Source1: "
-        f"{total_matches / max(processed, 1):.4f}"
+        f"Average matches/S1: "
+        f"{total_matches / max(processed, 1):.3f}"
     )
 
     print(
@@ -824,47 +1062,46 @@ def main():
     )
 
     print()
+
     print(
-        f"matching_results.tsv: "
-        f"{MATCH_PATH}"
+        f"matching_results.tsv:"
     )
 
     print(
-        f"candidate_pairs.tsv: "
-        f"{CANDIDATE_PATH}"
+        MATCH_FILE
     )
 
     print()
 
-    # -----------------------------------------------------------------------
-    # Basic row-count sanity check.
-    # -----------------------------------------------------------------------
+    print(
+        f"candidate_pairs.tsv:"
+    )
 
-    if processed != EXPECTED:
+    print(
+        CANDIDATE_FILE
+    )
+
+    print()
+
+    if processed == EXPECTED:
 
         print(
-            "WARNING: processed row count does not match "
-            f"expected {EXPECTED:,}."
+            "SUCCESS: all Source1 rows processed."
         )
 
     else:
 
         print(
-            "Source1 row count is correct."
+            "WARNING: output is incomplete!"
         )
 
-    print(
-        "Next step: run the official submission validator."
-    )
 
-
-# ===========================================================================
-# WINDOWS MULTIPROCESSING ENTRY POINT
-# ===========================================================================
+# ============================================================================
+# WINDOWS ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
 
-    # Required for Windows multiprocessing.
     mp.freeze_support()
 
     main()
