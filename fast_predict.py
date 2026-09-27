@@ -20,8 +20,11 @@ CACHE = ROOT / "cache"
 DB_PATH = CACHE / "er_index_test.sqlite"
 MODEL_PATH = CACHE / "lightgbm_matcher.txt"
 
-# Use several workers, but don't hammer the SQLite disk with too many.
-WORKERS = max(2, min(6, (os.cpu_count() or 4) - 1))
+SOURCE1_TOTAL = 1_732_544
+
+# Your i7-13620H has 16 logical processors.
+# Start conservatively because every worker also does RapidFuzz.
+WORKERS = max(2, min(8, (os.cpu_count() or 4) - 2))
 
 MODEL = None
 CALIBRATOR = None
@@ -30,28 +33,45 @@ CON = None
 
 
 def init_worker():
-    global MODEL, CALIBRATOR, THRESHOLD, CON
+    """
+    Runs once per worker process.
+    """
+    global MODEL
+    global CALIBRATOR
+    global THRESHOLD
+    global CON
 
-    MODEL = lgb.Booster(model_file=str(MODEL_PATH))
+    MODEL = lgb.Booster(
+        model_file=str(MODEL_PATH)
+    )
+
     CALIBRATOR = ber.load_calibrator()
     THRESHOLD = ber.load_threshold()
 
-    # Each worker gets its own read-only SQLite connection.
+    # Every worker gets its own read-only SQLite connection.
     CON = sqlite3.connect(
         f"file:{DB_PATH}?mode=ro",
         uri=True,
         timeout=60,
     )
 
-    # SQLite performance settings for read workload.
     CON.execute("PRAGMA query_only=ON")
+
+    # 64 MB SQLite page cache per worker.
     CON.execute("PRAGMA cache_size=-65536")
 
 
-def process_row(item):
-    global MODEL, CALIBRATOR, THRESHOLD, CON
+def process_row(job):
+    """
+    Process one Source-1 entity.
+    """
 
-    s1id, country, name, addr = item
+    global MODEL
+    global CALIBRATOR
+    global THRESHOLD
+    global CON
+
+    s1id, country, name, addr = job
 
     candidates = ber.candidate_rows(
         CON,
@@ -61,24 +81,32 @@ def process_row(item):
     )
 
     if not candidates:
-        return s1id, [], []
+        return (
+            s1id,
+            [],
+            [],
+        )
 
+    # Build the exact same 22-feature representation
+    # used by the trained model.
     features = np.asarray(
         [
             ber.pair_features(
                 name,
                 addr,
                 country,
-                c[4],
-                c[5],
-                c[3],
+                candidate[4],
+                candidate[5],
+                candidate[3],
             )
-            for c in candidates
+            for candidate in candidates
         ],
         dtype=np.float32,
     )
 
-    raw_probs = MODEL.predict(features)
+    raw_probs = MODEL.predict(
+        features
+    )
 
     cal_probs = ber.apply_calibrator(
         CALIBRATOR,
@@ -87,15 +115,30 @@ def process_row(item):
 
     matched = []
 
-    for c, p in zip(candidates, cal_probs):
+    for candidate, probability in zip(
+        candidates,
+        cal_probs,
+    ):
+        candidate_name = candidate[4]
+        candidate_addr = candidate[5]
+
         strong_name = (
             bool(
                 name
-                and c[4]
+                and candidate_name
                 and max(
-                    ber.safe_ratio(name, c[4]),
-                    ber.W(name, c[4]),
-                    ber.token_set(name, c[4]),
+                    ber.safe_ratio(
+                        name,
+                        candidate_name,
+                    ),
+                    ber.W(
+                        name,
+                        candidate_name,
+                    ),
+                    ber.token_set(
+                        name,
+                        candidate_name,
+                    ),
                 )
                 >= ber.KEEP_NAME
             )
@@ -104,33 +147,92 @@ def process_row(item):
         strong_addr = (
             bool(
                 addr
-                and c[5]
+                and candidate_addr
                 and max(
-                    ber.safe_ratio(addr, c[5]),
-                    ber.W(addr, c[5]),
-                    ber.token_set(addr, c[5]),
+                    ber.safe_ratio(
+                        addr,
+                        candidate_addr,
+                    ),
+                    ber.W(
+                        addr,
+                        candidate_addr,
+                    ),
+                    ber.token_set(
+                        addr,
+                        candidate_addr,
+                    ),
                 )
                 >= ber.KEEP_ADDRESS
             )
         )
 
-        if p >= THRESHOLD or (strong_name and strong_addr):
-            matched.append(c[1])
+        if (
+            probability >= THRESHOLD
+            or (strong_name and strong_addr)
+        ):
+            matched.append(
+                candidate[1]
+            )
 
-    candidate_ids = [c[1] for c in candidates]
+    candidate_ids = [
+        candidate[1]
+        for candidate in candidates
+    ]
 
-    return s1id, matched, candidate_ids
+    return (
+        s1id,
+        matched,
+        candidate_ids,
+    )
 
 
 def main():
-    print(f"Workers: {WORKERS}")
-    print(f"Test index: {DB_PATH}")
-    print(f"Model: {MODEL_PATH}")
 
-    OUTPUT.mkdir(parents=True, exist_ok=True)
+    print("=" * 60)
+    print("FAST PREDICTION")
+    print("=" * 60)
 
-    match_path = OUTPUT / "matching_results.tsv"
-    candidate_path = OUTPUT / "candidate_pairs.tsv"
+    print(
+        f"Workers: {WORKERS}"
+    )
+
+    print(
+        f"CPU logical processors: "
+        f"{os.cpu_count()}"
+    )
+
+    print(
+        f"Test index: {DB_PATH}"
+    )
+
+    print(
+        f"Model: {MODEL_PATH}"
+    )
+
+    print()
+
+    if not DB_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing test index: {DB_PATH}"
+        )
+
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing model: {MODEL_PATH}"
+        )
+
+    OUTPUT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    match_path = (
+        OUTPUT / "matching_results.tsv"
+    )
+
+    candidate_path = (
+        OUTPUT / "candidate_pairs.tsv"
+    )
 
     # Start fresh.
     match_path.write_text(
@@ -143,116 +245,208 @@ def main():
         encoding="utf-8",
     )
 
-    source1 = TEST / "test_source1.tsv"
+    source1_path = (
+        TEST / "test_source1.tsv"
+    )
 
-    total = 0
-    start = time.time()
+    start_time = time.time()
 
-    with (
-        match_path.open("a", encoding="utf-8", newline="") as mf,
-        candidate_path.open("a", encoding="utf-8", newline="") as cf,
-    ):
-        mw = csv.writer(
-            mf,
-            delimiter="\t",
-            lineterminator="\n",
-        )
+    processed = 0
 
-        cw = csv.writer(
-            cf,
-            delimiter="\t",
-            lineterminator="\n",
-        )
+    # Keep the pool alive for the ENTIRE prediction.
+    with mp.Pool(
+        processes=WORKERS,
+        initializer=init_worker,
+    ) as pool:
 
-        # Stream Source-1 rather than loading all 1.7M rows.
-        for chunk in pd.read_csv(
-            source1,
-            sep="\t",
-            dtype=str,
-            keep_default_na=False,
-            chunksize=8000,
+        with (
+            match_path.open(
+                "a",
+                encoding="utf-8",
+                newline="",
+            ) as match_file,
+
+            candidate_path.open(
+                "a",
+                encoding="utf-8",
+                newline="",
+            ) as candidate_file,
         ):
-            jobs = []
 
-            for row in chunk.itertuples(index=False):
-                s1id = str(row.entity_id)
-                country = str(row.country)
+            match_writer = csv.writer(
+                match_file,
+                delimiter="\t",
+                lineterminator="\n",
+            )
 
-                name = ber.normalize_name(
-                    row.business_name
-                )
+            candidate_writer = csv.writer(
+                candidate_file,
+                delimiter="\t",
+                lineterminator="\n",
+            )
 
-                addr = ber.normalize_address(
-                    row.address
-                )
+            # Stream Source-1.
+            #
+            # chunksize here controls how many jobs are
+            # dispatched to workers at a time.
+            source = pd.read_csv(
+                source1_path,
+                sep="\t",
+                dtype=str,
+                keep_default_na=False,
+                chunksize=16_000,
+            )
 
-                jobs.append(
-                    (
-                        s1id,
-                        country,
-                        name,
-                        addr,
+            for chunk in source:
+
+                jobs = []
+
+                for row in chunk.itertuples(
+                    index=False
+                ):
+
+                    s1id = str(
+                        row.entity_id
                     )
-                )
 
-            with mp.Pool(
-                processes=WORKERS,
-                initializer=init_worker,
-            ) as pool:
-                # Moderate chunks keep memory reasonable while
-                # allowing multiple records to run concurrently.
-                for s1id, matched, candidates in pool.imap(
+                    country = str(
+                        row.country
+                    )
+
+                    name = (
+                        ber.normalize_name(
+                            row.business_name
+                        )
+                    )
+
+                    addr = (
+                        ber.normalize_address(
+                            row.address
+                        )
+                    )
+
+                    jobs.append(
+                        (
+                            s1id,
+                            country,
+                            name,
+                            addr,
+                        )
+                    )
+
+                # map() preserves Source-1 order.
+                #
+                # chunksize=64 reduces multiprocessing
+                # communication overhead.
+                results = pool.imap(
                     process_row,
                     jobs,
-                    chunksize=32,
-                ):
-                    mw.writerow(
+                    chunksize=64,
+                )
+
+                for (
+                    s1id,
+                    matched,
+                    candidates,
+                ) in results:
+
+                    match_writer.writerow(
                         [
                             s1id,
                             ",".join(matched),
                         ]
                     )
 
-                    cw.writerow(
+                    candidate_writer.writerow(
                         [
                             s1id,
                             ",".join(candidates),
                         ]
                     )
 
-                    total += 1
+                    processed += 1
 
-                    if total % 10000 == 0:
-                        mf.flush()
-                        cf.flush()
+                    # Flush periodically so the output
+                    # files visibly grow during the run.
+                    if (
+                        processed % 5_000
+                        == 0
+                    ):
 
-                        elapsed = time.time() - start
-                        rate = total / max(elapsed, 1)
+                        match_file.flush()
+                        candidate_file.flush()
 
-                        remaining = (
-                            1_732_544 - total
+                        elapsed = (
+                            time.time()
+                            - start_time
                         )
 
-                        eta = remaining / max(rate, 0.001)
+                        rate = (
+                            processed
+                            / max(
+                                elapsed,
+                                0.001,
+                            )
+                        )
+
+                        remaining = (
+                            SOURCE1_TOTAL
+                            - processed
+                        )
+
+                        eta_seconds = (
+                            remaining
+                            / max(
+                                rate,
+                                0.001,
+                            )
+                        )
+
+                        percent = (
+                            100.0
+                            * processed
+                            / SOURCE1_TOTAL
+                        )
 
                         print(
-                            f"Processed {total:,} / 1,732,544 "
-                            f"({100 * total / 1_732_544:.2f}%) "
-                            f"| {rate:.1f} rows/s "
-                            f"| ETA {eta / 60:.1f} min",
+                            f"[{time.strftime('%H:%M:%S')}] "
+                            f"{processed:,}/{SOURCE1_TOTAL:,} "
+                            f"({percent:.2f}%) | "
+                            f"{rate:.1f} rows/s | "
+                            f"ETA "
+                            f"{eta_seconds / 60:.1f} min",
                             flush=True,
                         )
 
-    elapsed = time.time() - start
+    elapsed = (
+        time.time()
+        - start_time
+    )
 
     print()
-    print("========================================")
+    print("=" * 60)
     print("PREDICTION COMPLETE")
-    print("========================================")
-    print(f"Source-1 records: {total:,}")
-    print(f"Time: {elapsed / 60:.2f} minutes")
-    print(f"Matches: {match_path}")
-    print(f"Candidates: {candidate_path}")
+    print("=" * 60)
+
+    print(
+        f"Processed: "
+        f"{processed:,}"
+    )
+
+    print(
+        f"Time: "
+        f"{elapsed / 60:.2f} minutes"
+    )
+
+    print(
+        f"Matching results:"
+        f"\n  {match_path}"
+    )
+
+    print(
+        f"Candidate pairs:"
+        f"\n  {candidate_path}"
+    )
 
 
 if __name__ == "__main__":
