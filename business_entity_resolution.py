@@ -152,14 +152,14 @@ REPORT_TXT = OUTPUT / "training_report.txt"
 
 SOURCE1_BATCH = 4000
 INDEX_BATCH = 25_000
-# Training is intentionally sampled from Source-1. The full 2.2M-row
-# training set is excellent for final validation, but running every S1 entity
-# through six SQLite blocking queries makes model fitting unnecessarily slow.
-# 100k stratified S1 entities still gives hundreds of thousands of hard pairs.
-TRAIN_S1_SAMPLE_PER_COUNTRY = 50_000
-TRAIN_MAX_PAIRS = 1_000_000
-TRAIN_POSITIVE_TARGET = 120_000
+# Full-dataset training: every Source-1 entity is processed.  We keep the
+# number of expensive pair-feature calculations per entity bounded by selecting
+# only the strongest lexical negatives before computing all 22 features.
+TRAIN_MAX_PAIRS = None
+TRAIN_POSITIVE_TARGET = None
 NEG_PER_POS = 6
+SINGLETON_NEGATIVES = 3
+HARD_NEGATIVE_POOL_MULTIPLIER = 3
 HARD_NEGATIVE_FRACTION = 0.5
 
 # Candidate budgets. They are deliberately moderate because candidate_pairs.tsv
@@ -764,74 +764,36 @@ COMBINED_IDX = FEATURE_NAMES.index("combined")
 # Ground truth
 # ---------------------------------------------------------------------------
 
-def sample_training_s1_ids(path: Path, per_country: int = TRAIN_S1_SAMPLE_PER_COUNTRY) -> set[str]:
-    """Reservoir-sample a bounded, country-stratified subset of Source-1 IDs."""
-    rng = np.random.default_rng(42)
-    reservoirs: dict[str, list[str]] = {}
-    counts: Counter[str] = Counter()
+def load_ground_truth(path: Path) -> dict[str, set[str]]:
+    """Load the complete training ground truth.
 
-    log(
-        f"Sampling up to {per_country:,} Source-1 entities per country "
-        f"for fast training..."
-    )
-
-    for chunk in iter_tsv(path, 100_000):
-        for row in chunk.itertuples(index=False):
-            sid = str(row.entity_id)
-            country = str(row.country)
-            counts[country] += 1
-            bucket = reservoirs.setdefault(country, [])
-
-            n = counts[country]
-            if len(bucket) < per_country:
-                bucket.append(sid)
-            else:
-                j = int(rng.integers(0, n))
-                if j < per_country:
-                    bucket[j] = sid
-        del chunk
-
-    selected = {sid for bucket in reservoirs.values() for sid in bucket}
-    summary = ", ".join(
-        f"{country}={len(bucket):,}" for country, bucket in sorted(reservoirs.items())
-    )
-    log(f"Selected {len(selected):,} Source-1 entities ({summary})")
-    return selected
-
-
-def load_ground_truth_for_ids(
-    path: Path,
-    selected_ids: set[str],
-) -> dict[str, set[str]]:
-    """Load ground truth only for the sampled Source-1 entities."""
+    The ground-truth file has one compact row per Source-1 entity. Keeping only
+    entity IDs and matched IDs is far smaller than keeping candidate records or
+    feature matrices, and it lets the full 2.2M-entity training pass guarantee
+    that known positives are included.
+    """
     gt: dict[str, set[str]] = {}
-    log("Loading ground truth for sampled training entities...")
-
+    log("Loading complete ground truth for full-dataset training...")
     for chunk in iter_tsv(path, 100_000):
         for row in chunk.itertuples(index=False):
             s1 = str(row.source1_entity_id)
-            if s1 not in selected_ids:
-                continue
             raw = str(row.matched_entity_ids)
             gt[s1] = set(x for x in raw.split(",") if x) if raw else set()
         del chunk
-
-    log(f"Ground truth loaded for {len(gt):,} sampled S1 entities")
+    log(f"Ground truth loaded: {len(gt):,} S1 entities")
     return gt
 
 
-def iter_selected_s1_rows(path: Path, selected_ids: set[str]) -> Iterator[tuple[str, str, str, str]]:
-    """Stream only the sampled Source-1 rows on the second pass."""
+def iter_all_s1_rows(path: Path) -> Iterator[tuple[str, str, str, str]]:
+    """Stream every Source-1 row without building an S1 dataframe in memory."""
     for chunk in iter_tsv(path, 100_000):
         for row in chunk.itertuples(index=False):
-            sid = str(row.entity_id)
-            if sid in selected_ids:
-                yield (
-                    sid,
-                    str(row.country),
-                    normalize_name(row.business_name),
-                    normalize_address(row.business_address),
-                )
+            yield (
+                str(row.entity_id),
+                str(row.country),
+                normalize_name(row.business_name),
+                normalize_address(row.business_address),
+            )
         del chunk
 
 
@@ -1039,18 +1001,29 @@ def _select_negatives(negative_rows: list[np.ndarray], k: int, rng: np.random.Ge
     return np.concatenate([hard_idx, rand_idx]).astype(int).tolist()
 
 
+def _cheap_negative_score(
+    s1_name: str,
+    s1_addr: str,
+    cand_name: str,
+    cand_addr: str,
+) -> float:
+    """Cheap ranking used before the expensive 22-feature calculation."""
+    ns = fuzz.ratio(s1_name, cand_name) / 100.0 if s1_name and cand_name else 0.0
+    ads = fuzz.ratio(s1_addr, cand_addr) / 100.0 if s1_addr and cand_addr else 0.0
+    return 0.60 * ns + 0.40 * ads
+
+
 def sample_training_pairs(
     db_path: Path,
     gt: dict[str, set[str]],
-    selected_ids: set[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate a bounded training set from a stratified Source-1 sample.
+    """Train on the complete Source-1 dataset with bounded per-entity work.
 
-    Known positives are fetched directly from ground truth so blocking recall
-    cannot silently turn a true match into a training negative. Blocking is
-    still used to mine hard negatives. Only the sampled S1 entities are sent
-    through candidate generation, avoiding millions of SQLite queries.
+    Every Source-1 entity is visited. Known positives are fetched directly from
+    ground truth. For negatives, only the strongest cheap lexical near-misses
+    are sent through the full 22-feature extractor. This avoids calculating
+    expensive fuzzy features for every raw blocker candidate while still using
+    the entire training population.
     """
     con = sqlite3.connect(str(db_path), timeout=120)
     con.execute("PRAGMA busy_timeout=120000")
@@ -1062,101 +1035,120 @@ def sample_training_pairs(
 
     batch_x: list[np.ndarray] = []
     batch_y: list[int] = []
-    batch_g: list[str] = []
+    batch_g: list[int] = []
 
     pos_count = 0
     neg_count = 0
-    total = 0
+    total_candidates = 0
     processed = 0
     block_flush_every = 2_000
 
     s1_path = source_path("train", 1)
+    total_s1 = 2_206_821
     log(
-        f"Generating training candidates for {len(selected_ids):,} sampled "
-        f"Source-1 entities (hard-negative mining enabled)..."
+        f"Generating full-dataset training pairs for {total_s1:,} Source-1 "
+        f"entities (hard-negative mining enabled)..."
     )
 
-    for s1id, country, name, addr in iter_selected_s1_rows(s1_path, selected_ids):
+    for s1id, country, name, addr in iter_all_s1_rows(s1_path):
         truth = gt.get(s1id, set())
-
-        # Four cheap lexical blocks are enough for hard-negative mining here.
-        # The positives are injected directly from ground truth below.
         cands = candidate_rows_fast(con, country, name, addr)
 
-        # Guarantee all known positives are available to the classifier even
-        # when the lexical blocker misses one.
+        # Guarantee every known positive is represented.
         by_id = {c[1]: c for c in cands}
         if truth:
             for c in fetch_entity_rows(con, truth):
                 by_id[c[1]] = c
         cands = list(by_id.values())
 
+        positive_cands = []
+        negative_cands = []
+        for c in cands:
+            if c[1] in truth:
+                positive_cands.append(c)
+            else:
+                negative_cands.append(c)
+
+        # Rank negatives cheaply, then calculate all 22 features only for the
+        # strongest near-misses. This is the key speed optimization that makes
+        # a full 2.2M-entity pass practical.
+        if positive_cands:
+            negative_budget = min(
+                len(negative_cands),
+                NEG_PER_POS * len(positive_cands) * HARD_NEGATIVE_POOL_MULTIPLIER,
+            )
+        else:
+            negative_budget = min(len(negative_cands), SINGLETON_NEGATIVES * HARD_NEGATIVE_POOL_MULTIPLIER)
+
+        if negative_budget and len(negative_cands) > negative_budget:
+            ranked = sorted(
+                negative_cands,
+                key=lambda c: _cheap_negative_score(name, addr, c[4], c[5]),
+                reverse=True,
+            )
+            negative_cands = ranked[:negative_budget]
+
         positive_rows: list[np.ndarray] = []
         negative_rows: list[np.ndarray] = []
 
-        for c in cands:
-            cid = c[1]
-            feat = pair_features(name, addr, country, c[4], c[5], c[3])
-            if cid in truth:
-                positive_rows.append(feat)
-            else:
-                negative_rows.append(feat)
+        for c in positive_cands:
+            positive_rows.append(pair_features(name, addr, country, c[4], c[5], c[3]))
+
+        for c in negative_cands:
+            negative_rows.append(pair_features(name, addr, country, c[4], c[5], c[3]))
 
         if positive_rows:
             pos_count += len(positive_rows)
             for feat in positive_rows:
                 batch_x.append(feat)
                 batch_y.append(1)
-                batch_g.append(s1id)
+                batch_g.append(processed)
 
             k = min(len(negative_rows), NEG_PER_POS * len(positive_rows))
-            if k:
-                for i in _select_negatives(negative_rows, k, rng):
-                    batch_x.append(negative_rows[i])
-                    batch_y.append(0)
-                    batch_g.append(s1id)
-                    neg_count += 1
-        elif not truth and negative_rows:
-            # Singleton examples matter for the final precision-heavy metric.
-            k = min(3, len(negative_rows))
-            for i in _select_negatives(negative_rows, k, rng):
+            if k < len(negative_rows):
+                # Keep the hardest half plus a random half from the retained
+                # negative pool to avoid overfitting to one narrow error mode.
+                idx = _select_negatives(negative_rows, k, rng)
+            else:
+                idx = list(range(len(negative_rows)))
+            for i in idx:
                 batch_x.append(negative_rows[i])
                 batch_y.append(0)
-                batch_g.append(s1id)
+                batch_g.append(processed)
+                neg_count += 1
+        elif negative_rows:
+            k = min(SINGLETON_NEGATIVES, len(negative_rows))
+            idx = _select_negatives(negative_rows, k, rng)
+            for i in idx:
+                batch_x.append(negative_rows[i])
+                batch_y.append(0)
+                batch_g.append(processed)
                 neg_count += 1
 
-        total += len(cands)
+        total_candidates += len(cands)
         processed += 1
 
         if processed % block_flush_every == 0 and batch_x:
             X_blocks.append(np.asarray(batch_x, dtype=np.float32))
             y_blocks.append(np.asarray(batch_y, dtype=np.int8))
-            group_blocks.append(np.asarray(batch_g, dtype=object))
+            group_blocks.append(np.asarray(batch_g, dtype=np.int32))
             batch_x.clear()
             batch_y.clear()
             batch_g.clear()
 
-        if processed % 5_000 == 0:
+        if processed % 10_000 == 0:
             current_pairs = sum(len(x) for x in X_blocks) + len(batch_y)
             log(
-                f"training S1 sampled={processed:,}/{len(selected_ids):,} "
-                f"candidate_rows={total:,} pairs={current_pairs:,} "
-                f"positives={pos_count:,} RAM={ram_gb():.2f} GB"
+                f"training S1={processed:,}/{total_s1:,} "
+                f"candidate_rows={total_candidates:,} pairs={current_pairs:,} "
+                f"positives={pos_count:,} negatives={neg_count:,} "
+                f"RAM={ram_gb():.2f} GB"
             )
-
-        current_pairs = sum(len(x) for x in X_blocks) + len(batch_y)
-        if pos_count >= TRAIN_POSITIVE_TARGET:
-            log(f"Reached positive training target: {pos_count:,}")
-            break
-
-        if current_pairs >= TRAIN_MAX_PAIRS:
-            log(f"Reached training pair cap: {TRAIN_MAX_PAIRS:,}")
-            break
 
     if batch_x:
         X_blocks.append(np.asarray(batch_x, dtype=np.float32))
         y_blocks.append(np.asarray(batch_y, dtype=np.int8))
-        group_blocks.append(np.asarray(batch_g, dtype=object))
+        group_blocks.append(np.asarray(batch_g, dtype=np.int32))
 
     con.close()
 
@@ -1166,12 +1158,6 @@ def sample_training_pairs(
     X = np.concatenate(X_blocks, axis=0)
     y = np.concatenate(y_blocks, axis=0)
     groups = np.concatenate(group_blocks, axis=0)
-
-    if len(X) > TRAIN_MAX_PAIRS:
-        keep = rng.choice(len(X), size=TRAIN_MAX_PAIRS, replace=False)
-        X = X[keep]
-        y = y[keep]
-        groups = groups[keep]
 
     del X_blocks, y_blocks, group_blocks, batch_x, batch_y, batch_g
     gc.collect()
@@ -1252,9 +1238,8 @@ def train_model() -> None:
     build_index("train", rebuild=False)
     db_path = INDEX_DB.with_name(f"{INDEX_DB.stem}_train{INDEX_DB.suffix}")
 
-    selected_ids = sample_training_s1_ids(TRAIN / "train_source1.tsv")
-    gt = load_ground_truth_for_ids(TRAIN / "train_ground_truth.tsv", selected_ids)
-    X, y, groups = sample_training_pairs(db_path, gt, selected_ids)
+    gt = load_ground_truth(TRAIN / "train_ground_truth.tsv")
+    X, y, groups = sample_training_pairs(db_path, gt)
 
     # Split by Source-1 entity, not by individual pair. This prevents pairs
     # belonging to the same business from leaking across train/validation.
@@ -1309,7 +1294,32 @@ def train_model() -> None:
 
     generate_report(model.booster_, y[va], raw_va_probs, cal_va_probs, best_threshold, sweep)
 
-    del gt, selected_ids, groups, X, y, model
+    # Final fit: after choosing the tree count and decision threshold on the
+    # held-out Source-1 groups, retrain the saved model on ALL generated pairs.
+    # Thus a single `--mode train` command both tunes the model and produces
+    # the final model trained on the complete 2.2M-entity training population.
+    best_iter = int(model.booster_.best_iteration or 1200)
+    log(f"Final fit on all {len(X):,} training pairs using {best_iter} trees...")
+    final_model = lgb.LGBMClassifier(
+        objective="binary",
+        n_estimators=best_iter,
+        learning_rate=0.03,
+        num_leaves=47,
+        max_depth=8,
+        min_child_samples=30,
+        subsample=0.85,
+        subsample_freq=1,
+        colsample_bytree=0.85,
+        reg_alpha=0.2,
+        reg_lambda=2.0,
+        n_jobs=max(1, min(8, os.cpu_count() or 4)),
+        random_state=42,
+    )
+    final_model.fit(X, y)
+    final_model.booster_.save_model(str(MODEL_PATH))
+    log(f"Saved final full-data model: {MODEL_PATH}")
+
+    del gt, groups, X, y, model, final_model
     gc.collect()
 
 
