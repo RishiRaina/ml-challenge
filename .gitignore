@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# Allow this .gitignore
+!.gitignore
+
+# Allow the main Python script
+!business_entity_resolution.py
+
+# Allow the README
+!README.md
