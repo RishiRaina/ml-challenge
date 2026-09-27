@@ -1,9 +1,8 @@
-
 #!/usr/bin/env python3
 """
-Memory-safe business entity resolution pipeline.
+Memory-safe business entity resolution pipeline (accuracy-optimized).
 
-Design:
+Design (unchanged from the base pipeline):
   1. Stream TSVs; never load the 10M+ target rows into pandas.
   2. Build a disk-backed SQLite blocking index over Source 2/3.
   3. Multi-pass blocking:
@@ -19,13 +18,47 @@ Design:
   6. Write candidate_pairs.tsv and matching_results.tsv incrementally.
   7. CPU-only fallback if CUDA / FAISS GPU is unavailable.
 
-This file intentionally avoids global Python dictionaries/lists containing millions
-of records. SQLite is used as a disk-backed inverted index.
+What changed in this version, and why each change moves the needle on
+held-out pair accuracy:
+
+  - Feature set expanded from 16 -> 22 columns. The new features
+    (Jaro-Winkler similarity, token-set Jaccard, digit/zip/building-number
+    Jaccard, acronym match) target failure modes the old ratio-based
+    features under-weight: short names, transposed word order, and
+    numeric address components that fuzzy string ratios treat as "noise".
+
+  - Negative sampling is no longer uniform-random. Half of each record's
+    negative budget is now the *hardest* negatives (highest lexical
+    "combined" score that still isn't a true match) instead of random
+    ones. Uniform random negatives are almost all trivially easy (totally
+    unrelated businesses), so the old model was rarely shown the
+    confusable near-miss pairs that actually sit near the decision
+    boundary. Training on hard negatives is what typically buys the last
+    few points of precision/accuracy in this kind of pair classifier.
+
+  - Post-hoc probability calibration (isotonic regression, fit on the
+    held-out validation fold) is applied before thresholding, so a
+    predicted "0.7" actually means "~70% of these are true matches" on
+    unseen data, not just on the training distribution.
+
+  - The decision threshold (previously the hardcoded constant
+    KEEP_SCORE = 0.44) is now tuned by sweeping thresholds against the
+    validation fold and picking the one that maximizes F0.5 (precision
+    weighted 2x recall, matching the "macro F0.5" scoring criterion
+    referenced in the original code's comments). The tuned threshold is
+    persisted to cache/threshold.json and reused at predict time.
+
+  - A training report (metrics + confusion matrix + feature importance)
+    is written to output/training_report.{json,txt} every training run so
+    accuracy can be checked directly instead of assumed.
+
+This file still intentionally avoids global Python dictionaries/lists
+containing millions of records. SQLite is used as a disk-backed inverted
+index.
 
 Usage:
   python business_entity_resolution.py --mode train
   python business_entity_resolution.py --mode predict
-  python business_entity_resolution.py --mode all
 
 Expected layout:
   student_resource/
@@ -50,20 +83,22 @@ import argparse
 import csv
 import gc
 import hashlib
-import math
+import json
 import os
+import pickle
 import re
 import sqlite3
 import sys
 import time
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
-from typing import Iterable, Iterator, Sequence
+from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
 
 try:
     import psutil
@@ -85,6 +120,11 @@ try:
 except Exception:
     faiss = None
 
+try:
+    from sklearn.isotonic import IsotonicRegression
+except Exception:
+    IsotonicRegression = None
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -98,12 +138,18 @@ OUTPUT = ROOT / "output"
 CACHE = ROOT / "cache"
 INDEX_DB = Path(os.environ.get("BER_INDEX", str(CACHE / "er_index.sqlite")))
 MODEL_PATH = CACHE / "lightgbm_matcher.txt"
+CALIBRATOR_PATH = CACHE / "calibrator.pkl"
+THRESHOLD_PATH = CACHE / "threshold.json"
+REPORT_JSON = OUTPUT / "training_report.json"
+REPORT_TXT = OUTPUT / "training_report.txt"
 
 SOURCE1_BATCH = 4000
 INDEX_BATCH = 25_000
 TRAIN_MAX_PAIRS = 1_500_000
 TRAIN_POSITIVE_TARGET = 300_000
-NEG_PER_POS = 4
+NEG_PER_POS = 6          # was 4; wider negative budget so the hard/random
+                         # split below still has enough easy negatives too
+HARD_NEGATIVE_FRACTION = 0.5  # half the negative budget = hardest lexical near-misses
 
 # Candidate budgets. They are deliberately moderate because candidate_pairs.tsv
 # is the final set actually scored by the model.
@@ -113,13 +159,15 @@ PREFIX_MAX = 50
 ANN_K = 20
 FINAL_CANDIDATE_MAX = 80
 
-# A candidate can be kept without semantic retrieval if strong lexical evidence
-# exists. This helps avoid relying entirely on an embedding model.
-KEEP_SCORE = 0.44
+# Fallback safety-net thresholds if calibration/tuning artifacts are missing
+# (e.g. predicting without having trained first, or sklearn unavailable).
+# These are no longer the primary decision boundary -- see THRESHOLD_PATH.
+DEFAULT_KEEP_SCORE = 0.44
 KEEP_NAME = 0.88
 KEEP_ADDRESS = 0.88
 
 NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+DIGIT_RE = re.compile(r"\d+")
 
 LEGAL_SUFFIXES = {
     "limited", "ltd", "llp", "inc", "incorporated", "corp", "corporation",
@@ -211,6 +259,22 @@ def tokens(s: str) -> list[str]:
             seen.add(t)
             out.append(t)
     return out
+
+
+def digit_tokens(s: str) -> set[str]:
+    """Zip codes / building numbers / unit numbers -- strong disambiguators
+    that pure edit-distance ratios wash out because digits are only a small
+    fraction of the total string length."""
+    if not s:
+        return set()
+    return set(DIGIT_RE.findall(s))
+
+
+def acronym(s: str) -> str:
+    toks = s.split()
+    if len(toks) < 2:
+        return ""
+    return "".join(t[0] for t in toks if t)
 
 
 def token_hash(token: str) -> str:
@@ -580,6 +644,19 @@ def char_jaccard(a: str, b: str, n: int = 3) -> float:
     return len(sa & sb) / u if u else 0.0
 
 
+def jaro_winkler(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return float(JaroWinkler.normalized_similarity(a, b))
+
+
+def set_jaccard(sa: set, sb: set) -> float:
+    if not sa or not sb:
+        return 0.0
+    u = len(sa | sb)
+    return len(sa & sb) / u if u else 0.0
+
+
 def pair_features(
     s1_name: str,
     s1_addr: str,
@@ -593,25 +670,37 @@ def pair_features(
     nts = token_set(s1_name, cand_name)
     nto = token_sort(s1_name, cand_name)
     nj = char_jaccard(s1_name, cand_name)
+    njw = jaro_winkler(s1_name, cand_name)
 
     ads = safe_ratio(s1_addr, cand_addr)
     adw = W(s1_addr, cand_addr)
     adts = token_set(s1_addr, cand_addr)
     adto = token_sort(s1_addr, cand_addr)
     adj = char_jaccard(s1_addr, cand_addr)
+    adjw = jaro_winkler(s1_addr, cand_addr)
 
     exact_name = float(bool(s1_name and s1_name == cand_name))
     exact_addr = float(bool(s1_addr and s1_addr == cand_addr))
     same_country = float(s1_country == cand_country)
 
-    # Stronger combined feature for precision-heavy scoring.
-    combined = 0.58 * max(ns, nw, nts, nj) + 0.42 * max(ads, adw, adts, adj)
+    name_tok_jaccard = set_jaccard(set(tokens(s1_name)), set(tokens(cand_name)))
+    addr_tok_jaccard = set_jaccard(set(tokens(s1_addr)), set(tokens(cand_addr)))
+    digit_jaccard = set_jaccard(digit_tokens(s1_addr), digit_tokens(cand_addr))
+
+    a1 = acronym(s1_name)
+    a2 = acronym(cand_name)
+    acronym_match = float(bool(a1 and a1 == a2))
+
+    # Stronger combined feature for precision-heavy scoring and for ranking
+    # hard negatives during training.
+    combined = 0.58 * max(ns, nw, nts, nj, njw) + 0.42 * max(ads, adw, adts, adj, adjw)
 
     return np.asarray(
         [
-            ns, nw, nts, nto, nj,
-            ads, adw, adts, adto, adj,
+            ns, nw, nts, nto, nj, njw,
+            ads, adw, adts, adto, adj, adjw,
             exact_name, exact_addr, same_country,
+            name_tok_jaccard, addr_tok_jaccard, digit_jaccard, acronym_match,
             combined,
             abs(len(s1_name) - len(cand_name)),
             abs(len(s1_addr) - len(cand_addr)),
@@ -622,12 +711,16 @@ def pair_features(
 
 FEATURE_NAMES = [
     "name_ratio", "name_wratio", "name_token_set", "name_token_sort",
-    "name_char_jaccard",
+    "name_char_jaccard", "name_jaro_winkler",
     "addr_ratio", "addr_wratio", "addr_token_set", "addr_token_sort",
-    "addr_char_jaccard",
-    "exact_name", "exact_address", "same_country", "combined",
+    "addr_char_jaccard", "addr_jaro_winkler",
+    "exact_name", "exact_address", "same_country",
+    "name_token_jaccard", "addr_token_jaccard", "digit_jaccard", "acronym_match",
+    "combined",
     "name_len_diff", "addr_len_diff",
 ]
+
+COMBINED_IDX = FEATURE_NAMES.index("combined")
 
 
 # ---------------------------------------------------------------------------
@@ -655,14 +748,214 @@ def load_ground_truth(path: Path) -> dict[str, set[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Metrics (pure numpy -- no hard sklearn dependency for the core report)
+# ---------------------------------------------------------------------------
+
+def accuracy_score_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.mean(y_true == y_pred))
+
+
+def precision_recall_fbeta(y_true: np.ndarray, y_pred: np.ndarray, beta: float = 1.0):
+    tp = float(np.sum((y_pred == 1) & (y_true == 1)))
+    fp = float(np.sum((y_pred == 1) & (y_true == 0)))
+    fn = float(np.sum((y_pred == 0) & (y_true == 1)))
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    b2 = beta * beta
+    denom = (b2 * precision) + recall
+    fbeta = ((1 + b2) * precision * recall / denom) if denom > 0 else 0.0
+    return precision, recall, fbeta
+
+
+def roc_auc_np(y_true: np.ndarray, scores: np.ndarray) -> float:
+    """Rank-based AUC (Mann-Whitney U). Good enough for a diagnostic report;
+    use sklearn.metrics.roc_auc_score if you need exact tie handling."""
+    n_pos = int(np.sum(y_true == 1))
+    n_neg = int(np.sum(y_true == 0))
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(len(scores), dtype=np.float64)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    sum_ranks_pos = float(np.sum(ranks[y_true == 1]))
+    return (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+
+
+def tune_threshold(y_true: np.ndarray, probs: np.ndarray, beta: float = 0.5):
+    """Sweep thresholds and pick the one maximizing F-beta (default: F0.5,
+    i.e. precision weighted twice as heavily as recall)."""
+    thresholds = np.linspace(0.02, 0.98, 97)
+    best_t, best_score = 0.5, -1.0
+    sweep = []
+    for t in thresholds:
+        pred = (probs >= t).astype(np.int8)
+        p, r, f = precision_recall_fbeta(y_true, pred, beta=beta)
+        acc = accuracy_score_np(y_true, pred)
+        sweep.append({"threshold": float(t), "precision": p, "recall": r,
+                       "fbeta": f, "accuracy": acc})
+        if f > best_score:
+            best_score = f
+            best_t = float(t)
+    return best_t, sweep
+
+
+# ---------------------------------------------------------------------------
+# Calibration
+# ---------------------------------------------------------------------------
+
+def fit_calibrator(raw_probs: np.ndarray, y_true: np.ndarray):
+    if IsotonicRegression is None:
+        log("sklearn not available -- skipping probability calibration.")
+        return None
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(raw_probs, y_true)
+    return iso
+
+
+def apply_calibrator(calibrator, raw_probs: np.ndarray) -> np.ndarray:
+    if calibrator is None:
+        return raw_probs
+    return np.asarray(calibrator.predict(raw_probs), dtype=np.float64)
+
+
+def save_calibrator(calibrator) -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(CALIBRATOR_PATH, "wb") as f:
+        pickle.dump(calibrator, f)
+
+
+def load_calibrator():
+    if not CALIBRATOR_PATH.exists():
+        return None
+    try:
+        with open(CALIBRATOR_PATH, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return None
+
+
+def save_threshold(threshold: float) -> None:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(THRESHOLD_PATH, "w") as f:
+        json.dump({"probability_threshold": threshold}, f)
+
+
+def load_threshold() -> float:
+    if THRESHOLD_PATH.exists():
+        try:
+            with open(THRESHOLD_PATH) as f:
+                return float(json.load(f)["probability_threshold"])
+        except Exception:
+            pass
+    return DEFAULT_KEEP_SCORE
+
+
+# ---------------------------------------------------------------------------
+# Training report
+# ---------------------------------------------------------------------------
+
+def generate_report(booster, y_va, raw_probs, cal_probs, threshold, sweep) -> dict:
+    pred = (cal_probs >= threshold).astype(np.int8)
+    acc = accuracy_score_np(y_va, pred)
+    p1, r1, f1 = precision_recall_fbeta(y_va, pred, beta=1.0)
+    _, _, f05 = precision_recall_fbeta(y_va, pred, beta=0.5)
+    auc_raw = roc_auc_np(y_va, raw_probs)
+    auc_cal = roc_auc_np(y_va, cal_probs)
+
+    tp = int(np.sum((pred == 1) & (y_va == 1)))
+    fp = int(np.sum((pred == 1) & (y_va == 0)))
+    fn = int(np.sum((pred == 0) & (y_va == 1)))
+    tn = int(np.sum((pred == 0) & (y_va == 0)))
+
+    importances = sorted(
+        zip(FEATURE_NAMES, booster.feature_importance(importance_type="gain").tolist()),
+        key=lambda x: -x[1],
+    )
+
+    report = {
+        "validation_pairs": int(len(y_va)),
+        "validation_positive_rate": float(np.mean(y_va)),
+        "chosen_threshold": float(threshold),
+        "accuracy": acc,
+        "precision": p1,
+        "recall": r1,
+        "f1": f1,
+        "f0.5": f05,
+        "roc_auc_raw": auc_raw,
+        "roc_auc_calibrated": auc_cal,
+        "confusion_matrix": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "feature_importance_gain": importances,
+        "threshold_sweep": sweep,
+    }
+
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    with open(REPORT_JSON, "w") as f:
+        json.dump(report, f, indent=2)
+
+    with open(REPORT_TXT, "w") as f:
+        f.write("Training / validation report\n")
+        f.write("=============================\n")
+        f.write(f"Validation pairs:        {report['validation_pairs']:,}\n")
+        f.write(f"Positive rate:           {report['validation_positive_rate']:.4f}\n")
+        f.write(f"Chosen threshold:        {threshold:.3f}\n\n")
+        f.write(f"Accuracy:                {acc:.4%}\n")
+        f.write(f"Precision:               {p1:.4%}\n")
+        f.write(f"Recall:                  {r1:.4%}\n")
+        f.write(f"F1:                      {f1:.4f}\n")
+        f.write(f"F0.5:                    {f05:.4f}\n")
+        f.write(f"ROC-AUC (raw):           {auc_raw:.4f}\n")
+        f.write(f"ROC-AUC (calibrated):    {auc_cal:.4f}\n\n")
+        f.write(f"Confusion matrix: TP={tp} FP={fp} FN={fn} TN={tn}\n\n")
+        f.write("Top feature importances (gain):\n")
+        for name, gain in importances[:15]:
+            f.write(f"  {name:<22s} {gain:.1f}\n")
+
+    log(
+        f"VALIDATION  accuracy={acc:.4%}  precision={p1:.4%}  recall={r1:.4%}  "
+        f"f1={f1:.4f}  f0.5={f05:.4f}  auc={auc_cal:.4f}  threshold={threshold:.3f}"
+    )
+    log(f"Report written: {REPORT_JSON} / {REPORT_TXT}")
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+def _select_negatives(negative_rows: list[np.ndarray], k: int, rng: np.random.Generator) -> list[int]:
+    """Mix of hardest lexical near-misses and random negatives.
+
+    Uniform-random negatives are almost always trivially dissimilar, so a
+    model trained only on them learns a very loose decision boundary. Ranking
+    by the 'combined' lexical feature and taking the hardest half forces the
+    model to actually separate genuine matches from confusable non-matches.
+    """
+    n = len(negative_rows)
+    if n <= k:
+        return list(range(n))
+
+    combined_scores = np.asarray([row[COMBINED_IDX] for row in negative_rows])
+    order = np.argsort(-combined_scores)
+
+    n_hard = max(1, int(round(k * HARD_NEGATIVE_FRACTION)))
+    n_hard = min(n_hard, n)
+    hard_idx = order[:n_hard]
+
+    remaining = order[n_hard:]
+    n_rand = k - len(hard_idx)
+    if n_rand > 0 and len(remaining) > 0:
+        rand_idx = rng.choice(remaining, size=min(n_rand, len(remaining)), replace=False)
+    else:
+        rand_idx = np.array([], dtype=int)
+
+    return np.concatenate([hard_idx, rand_idx]).astype(int).tolist()
+
 
 def sample_training_pairs(db_path: Path, gt: dict[str, set[str]]) -> tuple[np.ndarray, np.ndarray]:
     """
     Stream S1 and generate candidates. Keep only a bounded feature matrix.
     Positives are always retained when the blocker finds them. Negatives are
-    capped per positive and sampled deterministically.
+    capped per positive and drawn as a hard/random mix (see _select_negatives).
     """
     con = sqlite3.connect(str(db_path))
     rng = np.random.default_rng(42)
@@ -674,7 +967,7 @@ def sample_training_pairs(db_path: Path, gt: dict[str, set[str]]) -> tuple[np.nd
     total = 0
 
     s1_path = source_path("train", 1)
-    log("Generating bounded training candidate sample...")
+    log("Generating bounded training candidate sample (hard-negative mining enabled)...")
 
     for chunk in iter_tsv(s1_path, SOURCE1_BATCH):
         xb = []
@@ -708,17 +1001,16 @@ def sample_training_pairs(db_path: Path, gt: dict[str, set[str]]) -> tuple[np.nd
 
                 k = min(len(negative_rows), NEG_PER_POS * len(positive_rows))
                 if k:
-                    idx = rng.choice(len(negative_rows), size=k, replace=False)
-                    for i in np.atleast_1d(idx):
-                        xb.append(negative_rows[int(i)])
+                    for i in _select_negatives(negative_rows, k, rng):
+                        xb.append(negative_rows[i])
                         yb.append(0)
                         neg_count += 1
             elif not truth and negative_rows:
-                # Singleton examples are important under macro F0.5.
+                # Singleton examples are important under macro F0.5. Prefer
+                # the hardest few negatives here too, not random ones.
                 k = min(3, len(negative_rows))
-                idx = rng.choice(len(negative_rows), size=k, replace=False)
-                for i in np.atleast_1d(idx):
-                    xb.append(negative_rows[int(i)])
+                for i in _select_negatives(negative_rows, k, rng):
+                    xb.append(negative_rows[i])
                     yb.append(0)
                     neg_count += 1
 
@@ -778,13 +1070,14 @@ def train_model() -> None:
 
     model = lgb.LGBMClassifier(
         objective="binary",
-        n_estimators=500,
-        learning_rate=0.045,
-        num_leaves=31,
+        n_estimators=1200,
+        learning_rate=0.03,
+        num_leaves=47,
         max_depth=8,
-        min_child_samples=40,
+        min_child_samples=30,
         subsample=0.85,
-        colsample_bytree=0.9,
+        subsample_freq=1,
+        colsample_bytree=0.85,
         reg_alpha=0.2,
         reg_lambda=2.0,
         n_jobs=max(1, min(8, os.cpu_count() or 4)),
@@ -795,12 +1088,26 @@ def train_model() -> None:
         X[tr],
         y[tr],
         eval_set=[(X[va], y[va])],
-        callbacks=[lgb.early_stopping(50, verbose=False)],
+        eval_metric=["auc", "binary_logloss"],
+        callbacks=[lgb.early_stopping(80, verbose=False)],
     )
 
     CACHE.mkdir(parents=True, exist_ok=True)
     model.booster_.save_model(str(MODEL_PATH))
     log(f"Saved model: {MODEL_PATH}")
+
+    # --- Calibration + threshold tuning on the held-out validation fold ---
+    raw_va_probs = model.booster_.predict(
+        X[va], num_iteration=model.booster_.best_iteration
+    )
+    calibrator = fit_calibrator(raw_va_probs, y[va])
+    cal_va_probs = apply_calibrator(calibrator, raw_va_probs)
+
+    best_threshold, sweep = tune_threshold(y[va], cal_va_probs, beta=0.5)
+    save_calibrator(calibrator)
+    save_threshold(best_threshold)
+
+    generate_report(model.booster_, y[va], raw_va_probs, cal_va_probs, best_threshold, sweep)
 
     del gt, X, y, model
     gc.collect()
@@ -843,12 +1150,14 @@ def score_candidate_batch(
     s1_addr: str,
     s1_country: str,
     candidates: list[tuple[int, str, int, str, str, str]],
+    calibrator,
+    threshold: float,
 ) -> tuple[list[tuple[str, float]], list[str]]:
     """
-    Score all candidates, then apply a precision-oriented threshold.
+    Score all candidates, then apply a precision-oriented, *tuned* threshold.
 
     Returns:
-      matches: (entity_id, probability)
+      matches: (entity_id, calibrated probability)
       final candidate IDs: exactly the IDs actually presented to the model.
     """
     if not candidates:
@@ -862,15 +1171,18 @@ def score_candidate_batch(
         for c in candidates
     ])
 
-    probs = model.predict(feats, num_iteration=model.best_iteration_)
-    pairs = [(c[1], float(p)) for c, p in zip(candidates, probs)]
+    raw_probs = model.predict(feats)
+    cal_probs = apply_calibrator(calibrator, raw_probs)
+    pairs = [(c[1], float(p)) for c, p in zip(candidates, cal_probs)]
 
     # The final candidate set is the model input. Do not filter candidate_pairs
     # after this point.
     final_candidates = [cid for cid, _ in pairs]
 
-    # Precision-heavy final decision. Strong exact lexical matches are allowed
-    # through even if the classifier is conservative.
+    # Precision-heavy final decision, using the tuned threshold. Strong exact
+    # lexical matches are still allowed through even if the (calibrated)
+    # classifier is conservative -- this is a safety net for near-duplicate
+    # records the model hasn't seen the like of during training.
     matches = []
     for (cid, p), c in zip(pairs, candidates):
         strong_name = (
@@ -890,7 +1202,7 @@ def score_candidate_batch(
                  ) >= KEEP_ADDRESS)
         )
 
-        if p >= KEEP_SCORE or (strong_name and strong_addr):
+        if p >= threshold or (strong_name and strong_addr):
             matches.append((cid, p))
 
     matches.sort(key=lambda x: x[1], reverse=True)
@@ -912,6 +1224,9 @@ def predict() -> None:
     con = sqlite3.connect(str(db_path))
 
     model = lgb.Booster(model_file=str(MODEL_PATH))
+    calibrator = load_calibrator()
+    threshold = load_threshold()
+    log(f"Using calibrated probabilities: {calibrator is not None}; threshold={threshold:.3f}")
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
     match_path = OUTPUT / "matching_results.tsv"
@@ -962,7 +1277,7 @@ def predict() -> None:
                     cands = [x[1] for x in scored[:FINAL_CANDIDATE_MAX]]
 
                 matches, final_candidates = score_candidate_batch(
-                    model, name, addr, country, cands
+                    model, name, addr, country, cands, calibrator, threshold
                 )
 
                 # Every output candidate is exactly what was passed to model.
@@ -1091,6 +1406,7 @@ def main() -> None:
     log(f"Device: {device_name()}")
     log(f"CUDA available: {cuda_available()}")
     log(f"FAISS available: {faiss is not None}")
+    log(f"sklearn (calibration) available: {IsotonicRegression is not None}")
     log_ram("Startup: ")
 
     if args.mode == "index-train":
